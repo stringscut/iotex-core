@@ -10,6 +10,7 @@ import (
 	"math/big"
 
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/iotexproject/go-pkgs/hash"
@@ -28,6 +29,8 @@ import (
 	"github.com/iotexproject/iotex-core/v2/state"
 	"github.com/iotexproject/iotex-core/v2/systemcontracts"
 )
+
+type RewardHistory = rewardHistory
 
 // rewardHistory is the dummy struct to record a reward. Only key matters.
 type rewardHistory struct{}
@@ -114,6 +117,26 @@ func (p *Protocol) GrantBlockReward(
 ) (*action.Log, error) {
 	actionCtx := protocol.MustGetActionCtx(ctx)
 	blkCtx := protocol.MustGetBlockCtx(ctx)
+	fCtx := protocol.MustGetFeatureCtx(ctx)
+
+	if fCtx.UseV2Storage {
+		// mark v1 reward history as not granted during the transition period
+		var indexBytes [8]byte
+		enc.MachineEndian.PutUint64(indexBytes[:], blkCtx.BlockHeight)
+		key := append(_blockRewardHistoryKeyPrefix, indexBytes[:]...)
+		err := p.deleteStateV1(sm, key, &rewardHistory{}, protocol.ErigonStoreOnlyOption())
+		if err != nil && !errors.Is(err, state.ErrErigonStoreNotSupported) {
+			return nil, err
+		}
+		// revert the changese for erigon storage optimazation
+		defer func() {
+			err = p.putStateV1(sm, key, &rewardHistory{}, protocol.ErigonStoreOnlyOption())
+			if err != nil && !errors.Is(err, state.ErrErigonStoreNotSupported) {
+				log.L().Panic("failed to put block reward history in Erigon store", zap.Error(err))
+			}
+		}()
+	}
+
 	if err := p.assertNoRewardYet(ctx, sm, _blockRewardHistoryKeyPrefix, blkCtx.BlockHeight); err != nil {
 		return nil, err
 	}
@@ -516,12 +539,38 @@ func (p *Protocol) slashDelegate(
 	candidate *state.Candidate,
 	amount *big.Int,
 ) (*action.Log, error) {
-	candidateAddr, err := address.FromString(candidate.Address)
-	if err != nil {
-		return nil, err
-	}
-	if err := stakingProtocol.SlashCandidate(ctx, sm, candidateAddr, amount); err != nil {
-		return nil, errors.Wrapf(err, "failed to slash candidate %s", candidate.Address)
+	var candidateAddr address.Address
+	var err error
+	switch {
+	case !protocol.MustGetFeatureWithHeightCtx(ctx).CandidateWithoutIdentity(blockHeight):
+		if candidate.Identity != "" {
+			candidateAddr, err = address.FromString(candidate.Identity)
+			if err != nil {
+				return nil, err
+			}
+			if err := stakingProtocol.SlashCandidateByID(ctx, sm, candidateAddr, amount); err != nil {
+				return nil, errors.Wrapf(err, "failed to slash candidate %s", candidate.Identity)
+			}
+			break
+		}
+		fallthrough
+	case protocol.MustGetFeatureCtx(ctx).CandidateSlashByOwner:
+		candidateAddr, err = address.FromString(candidate.Address)
+		if err != nil {
+			return nil, err
+		}
+		if err := stakingProtocol.SlashCandidateByID(ctx, sm, candidateAddr, amount); err != nil {
+			return nil, errors.Wrapf(err, "failed to slash candidate %s", candidate.Address)
+		}
+		break
+	default:
+		candidateAddr, err = address.FromString(candidate.Address)
+		if err != nil {
+			return nil, err
+		}
+		if err := stakingProtocol.SlashCandidateByOperator(ctx, sm, candidateAddr, amount); err != nil {
+			return nil, errors.Wrapf(err, "failed to slash candidate %s", candidate.Address)
+		}
 	}
 	data, err := p.encodeRewardLog(rewardingpb.RewardLog_UNPRODUCTIVE_SLASH, candidateAddr.String(), amount)
 	if err != nil {
@@ -558,8 +607,13 @@ func (p *Protocol) slashUqd(
 	slashLogs := make([]*action.Log, 0)
 	snapshot := view.Snapshot()
 	fCtx := protocol.MustGetFeatureCtx(ctx)
+	usingOperator := protocol.MustGetFeatureWithHeightCtx(ctx).CandidateWithoutIdentity(blockHeight)
 	for _, candidate := range candidates {
-		if missed, ok := uqdMap[candidate.Address]; ok {
+		id := candidate.Identity
+		if usingOperator {
+			id = candidate.Address
+		}
+		if missed, ok := uqdMap[id]; ok {
 			if missed == 0 {
 				// hard probation, no slash
 				continue
@@ -571,10 +625,10 @@ func (p *Protocol) slashUqd(
 				slashLogs = append(slashLogs, actLog)
 				totalSlashAmount.Add(totalSlashAmount, amount)
 			case staking.ErrNoSelfStakeBucket:
-				log.S().Errorf("Candidate %s doesn't have self-stake bucket, no slash", candidate.Address)
+				log.S().Errorf("Candidate %s doesn't have self-stake bucket, no slash", id)
 			case staking.ErrCandidateNotExist:
 				if !fCtx.CandidateSlashByOwner {
-					log.S().Errorf("Candidate %s doesn't exist, ignore slash", candidate.Address)
+					log.S().Errorf("Candidate %s doesn't exist, ignore slash", id)
 					continue
 				}
 				fallthrough

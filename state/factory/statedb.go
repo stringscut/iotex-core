@@ -46,6 +46,9 @@ type (
 		getHeight() (uint64, error)
 		putHeight(uint64) error
 	}
+	// StateDiffCallback is called after a block is committed with the captured state diff entries.
+	StateDiffCallback func(height uint64, entries []WriteQueueEntry, digest []byte)
+
 	// stateDB implements StateFactory interface, tracks changes to account/contract and batch-commits to DB
 	stateDB struct {
 		mutex                    sync.RWMutex
@@ -55,11 +58,12 @@ type (
 		dao                      daoRetrofitter
 		timerFactory             *prometheustimer.TimerFactory
 		workingsets              cache.LRUCache // lru cache for workingsets
-		protocolViews            *protocol.Views
+		protocolViews            protocol.Views
 		skipBlockValidationOnPut bool
 		ps                       *patchStore
 		erigonDB                 *erigonstore.ErigonDB
 		dependencies             []blockdao.BlockIndexer
+		diffCallback             StateDiffCallback
 	}
 )
 
@@ -90,6 +94,27 @@ func SkipBlockValidationStateDBOption() StateDBOption {
 	}
 }
 
+// DiffCallbackStateDBOption sets a callback invoked after each block commit
+// with the block's state diff entries. Used by ioSwarm for state diff streaming.
+func DiffCallbackStateDBOption(cb StateDiffCallback) StateDBOption {
+	return func(sdb *stateDB, cfg *Config) error {
+		sdb.diffCallback = cb
+		return nil
+	}
+}
+
+// SetDiffCallback sets the state diff callback on a Factory.
+// Returns false if the factory is not a stateDB (e.g., in-memory test factory).
+func SetDiffCallback(f Factory, cb StateDiffCallback) bool {
+	if sdb, ok := f.(*stateDB); ok {
+		sdb.mutex.Lock()
+		sdb.diffCallback = cb
+		sdb.mutex.Unlock()
+		return true
+	}
+	return false
+}
+
 // DisableWorkingSetCacheOption disable workingset cache
 func DisableWorkingSetCacheOption() StateDBOption {
 	return func(sdb *stateDB, cfg *Config) error {
@@ -104,7 +129,7 @@ func NewStateDB(cfg Config, dao db.KVStore, opts ...StateDBOption) (Factory, err
 		cfg:                cfg,
 		currentChainHeight: 0,
 		registry:           protocol.NewRegistry(),
-		protocolViews:      &protocol.Views{},
+		protocolViews:      protocol.NewViews(),
 		workingsets:        cache.NewThreadSafeLruCache(int(cfg.Chain.WorkingSetCacheSize)),
 		dependencies:       []blockdao.BlockIndexer{},
 	}
@@ -243,11 +268,41 @@ func (sdb *stateDB) AddDependency(indexer blockdao.BlockIndexer) {
 }
 
 func (sdb *stateDB) newReadOnlyWorkingSet(ctx context.Context, height uint64) (*workingSet, error) {
-	return sdb.newWorkingSetWithKVStore(ctx, height, &readOnlyKV{sdb.dao.atHeight(height)})
+	ws, err := sdb.newWorkingSetWithKVStore(ctx, height, &readOnlyKV{sdb.dao.atHeight(height)}, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create new read-only working set")
+	}
+	if sdb.erigonDB != nil {
+		if sdb.cfg.Chain.HistoryBlockRetention > 0 {
+			sdb.mutex.RLock()
+			tip := sdb.currentChainHeight
+			sdb.mutex.RUnlock()
+			if height < tip-sdb.cfg.Chain.HistoryBlockRetention {
+				return nil, errors.Wrapf(
+					ErrNotSupported,
+					"history is pruned, only supported for latest %d blocks, but requested height %d",
+					sdb.cfg.Chain.HistoryBlockRetention, height,
+				)
+			}
+		}
+		e, err := sdb.erigonDB.NewErigonStoreDryrun(ctx, height+1)
+		if err != nil {
+			return nil, err
+		}
+		ws.store = newErigonWorkingSetStoreForSimulate(e)
+	}
+	ws.views = protocol.NewLazyViews(func() protocol.Views {
+		views, err := sdb.registry.StartAll(ctx, ws)
+		if err != nil {
+			log.L().Panic("Failed to start all protocols for lazy views", zap.Error(err))
+		}
+		return views
+	})
+	return ws, nil
 }
 
 func (sdb *stateDB) newWorkingSet(ctx context.Context, height uint64) (*workingSet, error) {
-	ws, err := sdb.newWorkingSetWithKVStore(ctx, height, sdb.dao.atHeight(height))
+	ws, err := sdb.newWorkingSetWithKVStore(ctx, height, sdb.dao.atHeight(height), sdb.protocolViews.Fork())
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create new working set")
 	}
@@ -265,7 +320,7 @@ func (sdb *stateDB) newWorkingSet(ctx context.Context, height uint64) (*workingS
 	return ws, nil
 }
 
-func (sdb *stateDB) newWorkingSetWithKVStore(ctx context.Context, height uint64, kvstore db.KVStore) (*workingSet, error) {
+func (sdb *stateDB) newWorkingSetWithKVStore(ctx context.Context, height uint64, kvstore db.KVStore, views protocol.Views) (*workingSet, error) {
 	store, err := sdb.createWorkingSetStore(ctx, height, kvstore)
 	if err != nil {
 		return nil, err
@@ -273,7 +328,7 @@ func (sdb *stateDB) newWorkingSetWithKVStore(ctx context.Context, height uint64,
 	if err := store.Start(ctx); err != nil {
 		return nil, err
 	}
-	return newWorkingSet(height, sdb.protocolViews.Fork(), store, sdb), nil
+	return newWorkingSet(height, views, store, sdb), nil
 }
 
 func (sdb *stateDB) CreateWorkingSetStore(ctx context.Context, height uint64, kvstore db.KVStore) (workingSetStore, error) {
@@ -394,13 +449,6 @@ func (sdb *stateDB) WorkingSetAtTransaction(ctx context.Context, height uint64, 
 	if err != nil {
 		return nil, err
 	}
-	if sdb.erigonDB != nil {
-		e, err := sdb.erigonDB.NewErigonStoreDryrun(ctx, height)
-		if err != nil {
-			return nil, err
-		}
-		ws.store = newErigonWorkingSetStoreForSimulate(e)
-	}
 	// handle panic to ensure workingset is closed
 	defer func() {
 		if r := recover(); r != nil {
@@ -421,25 +469,6 @@ func (sdb *stateDB) WorkingSetAtHeight(ctx context.Context, height uint64) (prot
 	ws, err := sdb.newReadOnlyWorkingSet(ctx, height)
 	if err != nil {
 		return nil, err
-	}
-	if sdb.erigonDB != nil {
-		if sdb.cfg.Chain.HistoryBlockRetention > 0 {
-			sdb.mutex.RLock()
-			tip := sdb.currentChainHeight
-			sdb.mutex.RUnlock()
-			if height < tip-sdb.cfg.Chain.HistoryBlockRetention {
-				return nil, errors.Wrapf(
-					ErrNotSupported,
-					"history is pruned, only supported for latest %d blocks, but requested height %d",
-					sdb.cfg.Chain.HistoryBlockRetention, height,
-				)
-			}
-		}
-		e, err := sdb.erigonDB.NewErigonStoreDryrun(ctx, height+1)
-		if err != nil {
-			return nil, err
-		}
-		ws.store = newErigonWorkingSetStoreForSimulate(e)
 	}
 	return ws, nil
 }
@@ -472,14 +501,15 @@ func (sdb *stateDB) PutBlock(ctx context.Context, blk *block.Block) error {
 		}
 	}
 	sdb.mutex.Lock()
-	defer sdb.mutex.Unlock()
 	receipts, err := ws.Receipts()
 	if err != nil {
+		sdb.mutex.Unlock()
 		return err
 	}
 	blk.Receipts = receipts
 	h, _ := ws.Height()
 	if sdb.currentChainHeight+1 != h {
+		sdb.mutex.Unlock()
 		// another working set with correct version already committed, do nothing
 		return fmt.Errorf(
 			"current state height %d + 1 doesn't match working set height %d",
@@ -487,10 +517,21 @@ func (sdb *stateDB) PutBlock(ctx context.Context, blk *block.Block) error {
 		)
 	}
 	if err := ws.Commit(ctx, sdb.cfg.Chain.HistoryBlockRetention); err != nil {
+		sdb.mutex.Unlock()
 		return err
 	}
+	// Capture callback and entries before releasing lock
+	cb := sdb.diffCallback
+	diffEntries := ws.stateDiffEntries
+	diffDigest := ws.stateDiffDigest
 	sdb.protocolViews = ws.views
 	sdb.currentChainHeight = h
+	sdb.mutex.Unlock()
+	// Invoke state diff callback outside the mutex to avoid holding
+	// the lock during potentially slow broadcast operations
+	if cb != nil && len(diffEntries) > 0 {
+		cb(h, diffEntries, diffDigest)
+	}
 	for _, indexer := range sdb.dependencies {
 		if err := indexer.PutBlock(ctx, blk); err != nil {
 			return errors.Wrapf(err, "failed to update indexer %T", indexer)
